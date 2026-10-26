@@ -162,8 +162,15 @@ machine this was developed on, a display going to sleep by timeout sometimes pro
 notification whatsoever, and only the poll noticed it.
 
 **False positives.** DDC/CI is noisy: on a healthy monitor, isolated failures appeared 6 times in
-45 seconds. One failure therefore means nothing. The monitor is declared off only after 4
-consecutive failures, 200 ms apart. Retries are cheap because they happen only on suspicion.
+45 seconds. A single failure therefore means nothing, and the backlight must not flicker because
+of one. Two levels of protection:
+
+- each poll retries up to 4 times, 200 ms apart, before it reports silence;
+- a poll result is accepted only after **3 consecutive polls agree** that all monitors are silent
+  (about 9 seconds). Returning to the "on" state needs 2 agreeing polls.
+
+Measured on this machine, an earlier build without the second rule turned the backlight off and
+back on within 3 seconds — exactly the kind of flicker the counter prevents.
 
 **Cost.** Measured: ~47 ms of CPU per minute with polling every 3 seconds (0.08% of one core, shown
 as 0% in Task Manager). A DDC request blocks on the I²C bus rather than burning CPU, and a failed

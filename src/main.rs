@@ -60,6 +60,14 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(3);
 const DDC_ATTEMPTS: usize = 4;
 /// Пауза между повторами внутри одной проверки.
 const DDC_RETRY_GAP: Duration = Duration::from_millis(200);
+/// Сколько опросов подряд должны молчать все мониторы, чтобы поверить в это.
+///
+/// DDC/CI сбоит и на исправном мониторе: в замере одиночные отказы появлялись несколько раз
+/// за минуту, а при опросе каждые 3 секунды один такой провал гасил подсветку и через
+/// мгновение возвращал её. Решение принимается только после устойчивой картины.
+const OFF_CONFIRM_POLLS: u32 = 3;
+/// Сколько опросов подряд должны отвечать мониторы, чтобы вернуть подсветку.
+const ON_CONFIRM_POLLS: u32 = 2;
 /// Период проверки живости окна сообщений. Ожидание блокирующее, процессор не занимает.
 const HEALTH_CHECK_MS: u32 = 1000;
 /// Размер стека вспомогательных потоков: по умолчанию Rust резервирует 2 МБ на поток.
@@ -425,6 +433,9 @@ fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
         .spawn(move || {
             let mut monitors: Option<ddc::Monitors> = None;
             let mut acquire_failed = false;
+            // Счётчики подряд идущих опросов для защиты от дребезга DDC/CI.
+            let mut silent_streak: u32 = 0;
+            let mut alive_streak: u32 = 0;
             while matches!(rx.recv_timeout(WATCH_INTERVAL), Ok(()) | Err(RecvTimeoutError::Timeout)) {
                 // Топология изменилась — handles могли устареть.
                 if RESET_MONITORS.swap(false, Ordering::AcqRel) {
@@ -450,23 +461,52 @@ fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
                 let paused = DISPLAY_SLEEPING.load(Ordering::Acquire) || gone;
                 if paused {
                     MONITOR_SILENT.store(false, Ordering::Release);
-                } else if let Some(current) = monitors.as_ref() {
-                    let mut responsive = current.responsive();
-                    if !responsive {
-                        // Одиночный сбой DDC/CI ничего не значит: переспрашиваем несколько раз.
-                        for _ in 1..DDC_ATTEMPTS {
-                            sleep(DDC_RETRY_GAP);
-                            if current.responsive() {
-                                responsive = true;
-                                break;
+                    silent_streak = 0;
+                    alive_streak = 0;
+                } else {
+                    // Результат этого опроса: true — хотя бы один монитор ещё отвечает.
+                    let responsive = match monitors.as_ref() {
+                        Some(current) => {
+                            let mut r = current.responsive();
+                            if !r {
+                                for _ in 1..DDC_ATTEMPTS {
+                                    sleep(DDC_RETRY_GAP);
+                                    if current.responsive() {
+                                        r = true;
+                                        break;
+                                    }
+                                }
                             }
+                            if !r {
+                                // Handles могли умереть вместе с линией — перечислим заново.
+                                monitors = None;
+                            }
+                            r
                         }
+                        // Перечислить мониторы не удалось: при погашенных экранах это норма,
+                        // поэтому считаем опрос «молчащим», но решение примет счётчик.
+                        None => false,
+                    };
+
+                    if responsive {
+                        alive_streak += 1;
+                        silent_streak = 0;
+                    } else {
+                        silent_streak += 1;
+                        alive_streak = 0;
                     }
-                    if !responsive {
-                        // Все молчат. Handles могли умереть вместе с линией — перечислим заново.
-                        monitors = None;
-                    }
-                    MONITOR_SILENT.store(!responsive, Ordering::Release);
+
+                    // Подсветку гасим только по устойчивой картине, а возвращаем быстрее:
+                    // пусть лучше лишний раз погаснет, чем останется включённой при погасшем
+                    // экране — но и мигать из-за сбоя DDC она не должна.
+                    let silent = if silent_streak >= OFF_CONFIRM_POLLS {
+                        true
+                    } else if alive_streak >= ON_CONFIRM_POLLS {
+                        false
+                    } else {
+                        MONITOR_SILENT.load(Ordering::Acquire)
+                    };
+                    MONITOR_SILENT.store(silent, Ordering::Release);
                 }
 
                 reconcile();
