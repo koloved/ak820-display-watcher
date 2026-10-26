@@ -3,8 +3,13 @@
 //! Фоновый сервис: гасит подсветку AJAZZ AK820, когда изображение на экранах пропадает,
 //! и возвращает прежний вид подсветки, когда экран снова включается.
 //!
-//! События Windows приходят в окно сообщений; работа с HID и опрос DDC/CI выполняются
-//! в отдельных потоках, чтобы блокирующие вызовы не останавливали очередь сообщений.
+//! Устройство:
+//! - окно сообщений принимает события Windows и следит за собственным существованием;
+//! - поток наблюдения независимо опрашивает мониторы по DDC/CI и состояние топологии;
+//! - поток HID держит клавиатуру и выполняет команды.
+//!
+//! Состояние хранится в атомиках, поэтому вердикт можно принять из любого потока:
+//! решение не зависит от того, живо ли окно сообщений.
 
 mod ddc;
 #[path = "protocol.rs"]
@@ -14,8 +19,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Mutex;
 use std::thread::{sleep, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +29,7 @@ use hidapi::{HidApi, HidDevice};
 use protocol::{cmd, packet, read_requests, write_packets, CONFIG_LEN, INTERFACE, PID, USAGE, USAGE_PAGE, VID};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM, ERROR_ALREADY_EXISTS,
 };
 use windows_sys::Win32::System::Power::{RegisterPowerSettingNotification, POWERBROADCAST_SETTING};
 use windows_sys::Win32::System::RemoteDesktop::{
@@ -32,9 +38,10 @@ use windows_sys::Win32::System::RemoteDesktop::{
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::{Memory::SetProcessWorkingSetSizeEx, Threading::GetCurrentProcess};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, PostMessageW,
-    PostQuitMessage, RegisterClassW, TranslateMessage, DEVICE_NOTIFY_WINDOW_HANDLE, HWND_MESSAGE, MSG,
-    SM_CMONITORS, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetSystemMetrics, IsWindow,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, RegisterClassW, TranslateMessage,
+    DEVICE_NOTIFY_WINDOW_HANDLE, HWND_MESSAGE, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT,
+    SM_CMONITORS, WM_DESTROY, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_QUIT, WM_WTSSESSION_CHANGE, WNDCLASSW,
     PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
@@ -43,33 +50,20 @@ const WINDOW_CLASS: &str = "AK820_DisplayPowerWatcher_Window";
 const LOG_FILE_NAME: &str = "ak820-display-watcher.log";
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
-/// Сообщение от потока DDC: `wparam` = 1, если монитор отвечает.
-const WM_APP_DDC: u32 = WM_APP + 1;
-
-/// Период опроса DDC/CI. Опрос нужен только для монитора, выключенного кнопкой:
-/// остальные случаи Windows сообщает событиями.
-const DDC_INTERVAL: Duration = Duration::from_secs(10);
-/// Размер стека вспомогательных потоков. По умолчанию Rust резервирует 2 МБ на поток,
-/// а этим потокам хватает нескольких десятков килобайт.
-const STACK_SIZE: usize = 128 * 1024;
-/// Сколько раз подряд переспрашивать, прежде чем признать монитор выключенным.
+/// Период опроса мониторов. События питания приходят не всегда: на этой системе
+/// уход экранов в сон по таймауту не сопровождался ни одним уведомлением, поэтому
+/// реакция целиком зависит от опроса. Замерено, что вызов DDC блокируется на ожидании
+/// шины и не занимает процессор, так что частый опрос стоит примерно ничего.
+const WATCH_INTERVAL: Duration = Duration::from_secs(3);
+/// Сколько раз подряд переспрашивать, прежде чем признать мониторы погасшими.
 /// DDC/CI иногда сбоит на ровном месте, одиночному отказу доверять нельзя.
 const DDC_ATTEMPTS: usize = 4;
 /// Пауза между повторами внутри одной проверки.
-const DDC_RETRY_GAP: Duration = Duration::from_millis(250);
-
-/// Считать ли состояние «Dimmed» (`GUID_CONSOLE_DISPLAY_STATE` = 2) выключенным экраном.
-///
-/// На практике монитор, уходя в энергосбережение по DPMS, нередко рапортует `2`, а не `0`:
-/// изображения на нём уже нет, а Windows продолжает считать дисплей «затемнённым».
-/// Обратный случай — плавное снижение яркости планом питания при простое, когда картинка
-/// ещё видна. Для задачи «гасить подсветку, когда экран тёмный» верно первое, поэтому `2`
-/// трактуется как выключенный экран. Если понадобится обратное поведение, поставьте `false`.
-const DIMMED_MEANS_OFF: bool = true;
-
-static DDC_PAUSED: AtomicBool = AtomicBool::new(false);
-static DDC_RESET: AtomicBool = AtomicBool::new(false);
-static DDC_HWND: AtomicIsize = AtomicIsize::new(0);
+const DDC_RETRY_GAP: Duration = Duration::from_millis(200);
+/// Период проверки живости окна сообщений. Ожидание блокирующее, процессор не занимает.
+const HEALTH_CHECK_MS: u32 = 1000;
+/// Размер стека вспомогательных потоков: по умолчанию Rust резервирует 2 МБ на поток.
+const STACK_SIZE: usize = 128 * 1024;
 
 // GUID-ы питания дисплеев.
 const GUID_CONSOLE_DISPLAY_STATE: GUID = GUID {
@@ -90,6 +84,75 @@ const GUID_SESSION_DISPLAY_STATUS: GUID = GUID {
     data3: 0x4ddf,
     data4: [0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5],
 };
+
+// ---------------------------------------------------------------------------
+// Состояние: доступно из всех потоков
+// ---------------------------------------------------------------------------
+
+/// ОС сообщила, что дисплей погашен.
+static DISPLAY_SLEEPING: AtomicBool = AtomicBool::new(false);
+/// Сеанс заблокирован (`Win + L`). Влияет только на журнал.
+static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
+/// `SM_CMONITORS == 0` — мониторов нет вовсе.
+static MONITORS_GONE: AtomicBool = AtomicBool::new(false);
+/// Ни один монитор не ответил по DDC/CI — погашены все.
+static MONITOR_SILENT: AtomicBool = AtomicBool::new(false);
+/// Состояние, уже отправленное в поток HID.
+static APPLIED_OFF: AtomicBool = AtomicBool::new(false);
+/// Топология изменилась: handles мониторов нужно пересоздать.
+static RESET_MONITORS: AtomicBool = AtomicBool::new(false);
+
+static WORKER_TX: Mutex<Option<Sender<bool>>> = Mutex::new(None);
+static WATCH_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
+/// Сериализует выдачу команд, чтобы два потока не отправили их одновременно.
+static RECONCILE: Mutex<()> = Mutex::new(());
+
+/// Подсветка гасится только тогда, когда изображения нет ни на одном экране.
+///
+/// Блокировка сеанса намеренно не учитывается: на экране ввода пароля подсветка нужна,
+/// иначе в тёмной комнате клавиатуру не видно.
+fn should_be_off() -> bool {
+    DISPLAY_SLEEPING.load(Ordering::Acquire)
+        || MONITORS_GONE.load(Ordering::Acquire)
+        || MONITOR_SILENT.load(Ordering::Acquire)
+}
+
+/// Отправляет команду, только если результирующее состояние изменилось.
+fn reconcile() {
+    let _guard = RECONCILE.lock().unwrap_or_else(|e| e.into_inner());
+    let want_off = should_be_off();
+    if want_off == APPLIED_OFF.load(Ordering::Acquire) {
+        return;
+    }
+    log(&format!(
+        "Состояние: сон={} блокировка={} мониторы_отключены={} мониторы_молчат={} → выключить={want_off}",
+        DISPLAY_SLEEPING.load(Ordering::Acquire),
+        SESSION_LOCKED.load(Ordering::Acquire),
+        MONITORS_GONE.load(Ordering::Acquire),
+        MONITOR_SILENT.load(Ordering::Acquire),
+    ));
+    if let Ok(guard) = WORKER_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(want_off);
+        }
+    }
+    APPLIED_OFF.store(want_off, Ordering::Release);
+}
+
+/// Экран снова включился: прежний вывод DDC устарел, подсветка возвращается сразу.
+fn display_on() {
+    DISPLAY_SLEEPING.store(false, Ordering::Release);
+    MONITOR_SILENT.store(false, Ordering::Release);
+}
+
+/// Будит поток наблюдения, чтобы он проверил мониторы немедленно.
+fn nudge_watch() {
+    if let Ok(guard) = WATCH_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(());
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Журнал
@@ -178,8 +241,8 @@ impl Keyboard {
 
         let started_open = std::time::Instant::now();
         let opened = api.open_path(&path);
-        // Список всех HID-устройств системы держать незачем: он нужен только для поиска.
-        // Дескриптор устройства живёт независимо, поэтому перечисление освобождаем.
+        // Список всех HID-устройств держать незачем: он нужен только для поиска, а
+        // открытый дескриптор от него не зависит.
         self.api = None;
         match opened {
             Ok(dev) => {
@@ -228,11 +291,11 @@ impl Keyboard {
             .next()
             .expect("один запрос на 29 байт");
         let resp = self.send(&req)?;
-        let mut cfg = [0u8; CONFIG_LEN];
         let available = resp.len().saturating_sub(8).min(len);
         if available < CONFIG_LEN {
             return Err(format!("короткий ответ: {available} байт"));
         }
+        let mut cfg = [0u8; CONFIG_LEN];
         cfg.copy_from_slice(&resp[8..8 + CONFIG_LEN]);
         Ok(cfg)
     }
@@ -276,8 +339,7 @@ impl Keyboard {
 
     /// Возвращает подсветку к сохранённой конфигурации.
     ///
-    /// Если конфиг не снимался, значит подсветку и не гасили — ничего не трогаем,
-    /// чтобы не изменить настройки пользователя.
+    /// Если конфиг не снимался, подсветку и не гасили — ничего не трогаем.
     fn restore(&mut self) -> bool {
         let Some(cfg) = self.saved else {
             return false;
@@ -298,206 +360,188 @@ impl Keyboard {
 }
 
 // ---------------------------------------------------------------------------
-// Рабочий поток: очередь команд к клавиатуре
+// Поток HID
 // ---------------------------------------------------------------------------
 
-/// Поток, который держит HID-соединение и обрабатывает команды по очереди.
-fn spawn_worker() -> (Sender<bool>, std::thread::JoinHandle<()>) {
+fn spawn_worker() -> (Sender<bool>, JoinHandle<()>) {
     let (tx, rx): (Sender<bool>, Receiver<bool>) = channel();
     let handle = std::thread::Builder::new()
         .name("hid".into())
         .stack_size(STACK_SIZE)
         .spawn(move || {
-        let mut kb = Keyboard::new();
-        let mut off = false;
+            let mut kb = Keyboard::new();
+            let mut off = false;
 
-        // Подключаемся заранее: первое перечисление HID занимает до 10 секунд,
-        // и делать его в момент блокировки экрана нельзя.
-        let started = std::time::Instant::now();
-        if kb.connect() {
-            log(&format!("Готов к работе (подключение {} мс)", started.elapsed().as_millis()));
-        } else {
-            log("Клавиатура не найдена, подключусь при первом событии");
-        }
-
-        // Блокирующее ожидание: без опроса, поток спит пока нет команд.
-        while let Ok(first) = rx.recv() {
-            let mut want_off = first;
-            // Пока поток был занят, события могли накопиться: берём последнее,
-            // чтобы не мигать подсветкой серией устаревших команд.
-            while let Ok(v) = rx.try_recv() {
-                want_off = v;
-            }
-            off = want_off;
-            if want_off {
-                kb.turn_off();
+            // Подключаемся заранее: перечисление HID занимает до 10 секунд, и делать его
+            // в момент, когда экран уже погас, нельзя.
+            let started = std::time::Instant::now();
+            if kb.connect() {
+                log(&format!("Готов к работе (подключение {} мс)", started.elapsed().as_millis()));
             } else {
+                log("Клавиатура не найдена, подключусь при первом событии");
+            }
+
+            // Блокирующее ожидание: без опроса, поток спит пока нет команд.
+            while let Ok(first) = rx.recv() {
+                let mut want_off = first;
+                // Пока поток был занят, события могли накопиться: берём последнее,
+                // чтобы не мигать подсветкой серией устаревших команд.
+                while let Ok(v) = rx.try_recv() {
+                    want_off = v;
+                }
+                off = want_off;
+                if want_off {
+                    kb.turn_off();
+                } else {
+                    kb.restore();
+                }
+                // Команда выполнена, до следующего события процесс ничего не делает.
+                trim_working_set();
+            }
+
+            // Сервис останавливают — подсветку не оставляем погашенной.
+            if off {
                 kb.restore();
             }
-            // Команда выполнена, до следующего события процесс ничего не делает.
-            trim_working_set();
-        }
-
-        // Сервис останавливают — подсветку не оставляем погашенной.
-        if off {
-            kb.restore();
-        }
-        log("Рабочий поток завершён");
+            log("Рабочий поток завершён");
         })
         .expect("не удалось запустить поток HID");
     (tx, handle)
 }
 
 // ---------------------------------------------------------------------------
-// Поток DDC/CI: замечает монитор, выключенный кнопкой
+// Поток наблюдения: топология и DDC/CI
 // ---------------------------------------------------------------------------
 
-/// Раз в `DDC_INTERVAL` спрашивает монитор, отвечает ли он, и сообщает результат окну.
+/// Раз в `WATCH_INTERVAL` (или немедленно по запросу) проверяет, есть ли изображение.
 ///
-/// Между опросами поток спит в `recv_timeout`, поэтому в простое не занимает процессор:
-/// одна проверка — один вызов драйвера, всё остальное время поток заблокирован.
-fn spawn_ddc_watcher() -> (Sender<()>, JoinHandle<()>) {
+/// Здесь же ловится монитор, выключенный кнопкой: Windows об этом не сообщает вообще,
+/// единственный признак — монитор перестаёт отвечать на DDC-запрос.
+fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
     let (tx, rx) = channel::<()>();
     let handle = std::thread::Builder::new()
-        .name("ddc".into())
+        .name("watch".into())
         .stack_size(STACK_SIZE)
         .spawn(move || {
-        let mut monitors: Option<ddc::Monitors> = None;
-        // recv_timeout ждёт с таймаутом: поток спит между опросами и просыпается
-        // сразу, когда канал закрывают при остановке сервиса.
-        while matches!(rx.recv_timeout(DDC_INTERVAL), Ok(()) | Err(RecvTimeoutError::Timeout)) {
-            // ОС уже сообщила, что экран погашен — события расскажут о пробуждении.
-            if DDC_PAUSED.load(Ordering::Relaxed) {
-                monitors = None;
-                continue;
-            }
-            // Топология изменилась: handles могли устареть.
-            if DDC_RESET.swap(false, Ordering::Relaxed) {
-                monitors = None;
-            }
-            if monitors.is_none() {
-                monitors = ddc::Monitors::acquire();
-            }
-            let Some(current) = monitors.as_ref() else {
-                // Мониторов не видно — решает проверка топологии, а не DDC.
-                continue;
-            };
-
-            let mut responsive = current.responsive();
-            if !responsive {
-                // Одиночный сбой DDC/CI ничего не значит: переспрашиваем несколько раз
-                // подряд. Повторы стоят дёшево и случаются только при подозрении.
-                for _ in 1..DDC_ATTEMPTS {
-                    sleep(DDC_RETRY_GAP);
-                    if current.responsive() {
-                        responsive = true;
-                        break;
+            let mut monitors: Option<ddc::Monitors> = None;
+            let mut acquire_failed = false;
+            while matches!(rx.recv_timeout(WATCH_INTERVAL), Ok(()) | Err(RecvTimeoutError::Timeout)) {
+                // Топология изменилась — handles могли устареть.
+                if RESET_MONITORS.swap(false, Ordering::AcqRel) {
+                    monitors = None;
+                }
+                if monitors.is_none() {
+                    monitors = ddc::Monitors::acquire();
+                    // Молча ничего не проверять нельзя: без этого «не удалось перечислить»
+                    // выглядело бы как «всё хорошо».
+                    if monitors.is_none() && !acquire_failed {
+                        log("DDC: не удалось перечислить мониторы");
+                        acquire_failed = true;
+                    } else if monitors.is_some() && acquire_failed {
+                        log("DDC: мониторы снова перечисляются");
+                        acquire_failed = false;
                     }
                 }
-            }
-            if !responsive {
-                // Монитор молчит — handles могли умереть вместе с линией.
-                // Следующий цикл перечислит их заново, чтобы не застрять в «выключено».
-                monitors = None;
-            }
 
-            let hwnd = DDC_HWND.load(Ordering::Relaxed);
-            if hwnd != 0 {
-                unsafe {
-                    PostMessageW(hwnd as HWND, WM_APP_DDC, usize::from(responsive), 0);
+                let gone = unsafe { GetSystemMetrics(SM_CMONITORS) == 0 };
+                MONITORS_GONE.store(gone, Ordering::Release);
+
+                // Если ОС уже знает, что дисплей погашен, опрос ничего не добавит.
+                let paused = DISPLAY_SLEEPING.load(Ordering::Acquire) || gone;
+                if paused {
+                    MONITOR_SILENT.store(false, Ordering::Release);
+                } else if let Some(current) = monitors.as_ref() {
+                    let mut responsive = current.responsive();
+                    if !responsive {
+                        // Одиночный сбой DDC/CI ничего не значит: переспрашиваем несколько раз.
+                        for _ in 1..DDC_ATTEMPTS {
+                            sleep(DDC_RETRY_GAP);
+                            if current.responsive() {
+                                responsive = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !responsive {
+                        // Все молчат. Handles могли умереть вместе с линией — перечислим заново.
+                        monitors = None;
+                    }
+                    MONITOR_SILENT.store(!responsive, Ordering::Release);
                 }
+
+                reconcile();
             }
-        }
-        log("Поток DDC завершён");
+            log("Поток наблюдения завершён");
         })
-        .expect("не удалось запустить поток DDC");
+        .expect("не удалось запустить поток наблюдения");
     (tx, handle)
 }
 
 // ---------------------------------------------------------------------------
-// Состояние
+// Окно сообщений
 // ---------------------------------------------------------------------------
 
-struct State {
-    /// ОС сообщила, что дисплей погашен (таймаут, сон системы).
-    display_sleeping: bool,
-    /// Сеанс заблокирован (`Win + L`). Влияет только на журнал.
-    session_locked: bool,
-    /// `SM_CMONITORS == 0` — мониторов нет вовсе.
-    monitors_disconnected: bool,
-    /// Монитор перестал отвечать по DDC/CI: выключен кнопкой.
-    monitor_unresponsive: bool,
-    /// Состояние, уже отправленное в рабочий поток.
-    applied_off: bool,
-    tx: Sender<bool>,
-}
+/// Создаёт message-only окно и подписывается на все нужные уведомления.
+fn create_message_window(hinstance: HINSTANCE) -> HWND {
+    unsafe {
+        let class_name = wide(WINDOW_CLASS);
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: ptr::null_mut(),
+            hCursor: ptr::null_mut(),
+            hbrBackground: ptr::null_mut(),
+            lpszMenuName: ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        // Класс регистрируется один раз; повторная регистрация просто вернёт ошибку.
+        RegisterClassW(&wc);
 
-impl State {
-    /// Подсветка гасится только тогда, когда изображения на экранах нет.
-    ///
-    /// Блокировка сеанса намеренно не учитывается: на экране ввода пароля подсветка
-    /// нужна оставаться включённой, иначе в тёмной комнате клавиатуру не видно.
-    /// Как только экран гаснет (по таймауту или кнопкой), подсветка выключается.
-    fn should_be_off(&self) -> bool {
-        self.display_sleeping || self.monitors_disconnected || self.monitor_unresponsive
-    }
-
-    /// Экран снова включился.
-    ///
-    /// Вывод DDC после пробуждения устарел: пока экран был погашен, опрос не шёл,
-    /// и флаг «монитор молчит» мог остаться с прошлого раза. Сбрасываем его
-    /// оптимистично, чтобы подсветка вернулась сразу, а не ждала следующего опроса.
-    /// Если монитор действительно выключен, ближайшая проверка вернёт всё обратно.
-    fn display_on(&mut self) {
-        self.display_sleeping = false;
-        self.monitor_unresponsive = false;
-    }
-
-    /// Отправляет команду только при изменении результирующего состояния.
-    fn reconcile(&mut self) {
-        // Пока ОС сама знает, что экран погашен, опрос DDC не нужен: он ничего
-        // не добавит, а стоит вызова драйвера.
-        DDC_PAUSED.store(self.display_sleeping || self.monitors_disconnected, Ordering::Relaxed);
-
-        let want_off = self.should_be_off();
-        if want_off == self.applied_off {
-            return;
+        // Message-only окно: не рисуется, поэтому нагрузка в простое нулевая.
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            ptr::null_mut(),
+            hinstance,
+            ptr::null(),
+        );
+        if hwnd.is_null() {
+            return hwnd;
         }
-        log(&format!(
-            "Состояние: сон={} блокировка={} мониторы_отключены={} монитор_молчит={} → выключить={want_off}",
-            self.display_sleeping, self.session_locked, self.monitors_disconnected, self.monitor_unresponsive
-        ));
-        if self.tx.send(want_off).is_err() {
-            log("Рабочий поток недоступен");
+
+        for guid in [
+            &GUID_CONSOLE_DISPLAY_STATE,
+            &GUID_MONITOR_POWER_ON,
+            &GUID_SESSION_DISPLAY_STATUS,
+        ] {
+            RegisterPowerSettingNotification(hwnd as _, guid, DEVICE_NOTIFY_WINDOW_HANDLE);
         }
-        self.applied_off = want_off;
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        hwnd
     }
-}
-
-// ---------------------------------------------------------------------------
-// Оконная процедура
-// ---------------------------------------------------------------------------
-
-static mut STATE: *mut State = ptr::null_mut();
-
-fn state() -> &'static mut State {
-    // SAFETY: STATE создаётся в main до окна и живёт до его закрытия;
-    // оконная процедура вызывается только из потока сообщений.
-    unsafe { &mut *STATE }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_WTSSESSION_CHANGE => {
-            let st = state();
             match wparam as u32 {
                 WTS_SESSION_LOCK => {
-                    st.session_locked = true;
+                    SESSION_LOCKED.store(true, Ordering::Release);
                     // Подсветку не трогаем: на экране ввода пароля она нужна.
                     log("Сеанс заблокирован — подсветка остаётся включённой");
                 }
                 WTS_SESSION_UNLOCK => {
-                    st.session_locked = false;
+                    SESSION_LOCKED.store(false, Ordering::Release);
                     log("Сеанс разблокирован");
                 }
                 _ => {}
@@ -505,15 +549,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_POWERBROADCAST => {
-            let st = state();
             match wparam as u32 {
                 PBT_APMSUSPEND => {
-                    st.display_sleeping = true;
-                    st.reconcile();
+                    DISPLAY_SLEEPING.store(true, Ordering::Release);
+                    reconcile();
                 }
                 PBT_APMRESUMEAUTOMATIC => {
-                    st.display_on();
-                    st.reconcile();
+                    display_on();
+                    reconcile();
                 }
                 PBT_POWERSETTINGCHANGE => {
                     let setting = lparam as *const POWERBROADCAST_SETTING;
@@ -533,24 +576,26 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         if let Some(name) = name {
                             log(&format!("Питание дисплея: {name} = {value}"));
                         }
-                        // Решение принимается только по состоянию самого дисплея.
-                        // session_display_status описывает доступность дисплея сеансу и
-                        // остаётся 1 при погашенном экране, из-за чего состояние дёргалось.
+                        // Решение принимается только по состоянию самого дисплея:
+                        // session_display_status описывает доступность дисплея сеансу.
                         let is_display = guid_eq(&s.PowerSetting, &GUID_CONSOLE_DISPLAY_STATE)
                             || guid_eq(&s.PowerSetting, &GUID_MONITOR_POWER_ON);
                         if is_display {
-                            // 0 = выключен, 1 = включён, 2 = затемнён.
-                            let off = match value {
-                                0 => true,
-                                2 => DIMMED_MEANS_OFF,
-                                _ => false,
-                            };
-                            if off {
-                                st.display_sleeping = true;
-                            } else {
-                                st.display_on();
+                            match value {
+                                0 => {
+                                    DISPLAY_SLEEPING.store(true, Ordering::Release);
+                                    reconcile();
+                                }
+                                1 => {
+                                    display_on();
+                                    reconcile();
+                                }
+                                _ => {
+                                    // «Затемнён» — неоднозначно: погаснуть могли не все мониторы.
+                                    // Будим наблюдение, пусть решает опрос DDC.
+                                    nudge_watch();
+                                }
                             }
-                            st.reconcile();
                         }
                     }
                 }
@@ -559,27 +604,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             1
         }
         WM_DISPLAYCHANGE => {
-            let st = state();
             log("Смена конфигурации дисплеев");
-            DDC_RESET.store(true, Ordering::Relaxed);
-            st.monitors_disconnected = GetSystemMetrics(SM_CMONITORS) == 0;
+            RESET_MONITORS.store(true, Ordering::Release);
+            MONITORS_GONE.store(GetSystemMetrics(SM_CMONITORS) == 0, Ordering::Release);
             log_display_topology();
-            st.reconcile();
-            0
-        }
-        WM_APP_DDC => {
-            // Пришло от потока DDC: монитор ответил (1) или промолчал (0).
-            let st = state();
-            let unresponsive = wparam == 0;
-            if st.monitor_unresponsive != unresponsive {
-                st.monitor_unresponsive = unresponsive;
-                log(if unresponsive {
-                    "DDC: монитор не отвечает — считаю выключенным"
-                } else {
-                    "DDC: монитор снова отвечает"
-                });
-                st.reconcile();
-            }
+            nudge_watch();
+            reconcile();
             0
         }
         WM_DESTROY => {
@@ -595,8 +625,6 @@ fn guid_eq(a: &GUID, b: &GUID) -> bool {
 }
 
 /// Пишет в журнал, какие дисплеи Windows сейчас считает подключёнными.
-/// Нужно для диагностики: включённый и выключенный физически монитор
-/// различаются только по флагам состояния.
 fn log_display_topology() {
     unsafe {
         use windows_sys::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
@@ -641,10 +669,9 @@ fn wide(s: &str) -> Vec<u16> {
 /// Отдаёт системе страницы, к которым процесс больше не будет обращаться.
 ///
 /// Основную часть рабочего набора занимают отображённые библиотеки: `SETUPAPI`,
-/// `user32`, `combase` и прочие. После инициализации они не нужны, и их можно выгрузить.
-/// Это не освобождает память системы (страницы общие и остаются резидентными для других
-/// процессов), но снимает с процесса обязанность держать их в своём рабочем наборе.
-/// При следующем обращении страницы подгружаются обратно автоматически.
+/// `user32`, `combase` и прочие. После инициализации они не нужны. Это не освобождает
+/// память системы (страницы общие и остаются резидентными для других процессов),
+/// но снимает с процесса обязанность держать их в своём рабочем наборе.
 fn trim_working_set() {
     unsafe {
         SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0);
@@ -662,88 +689,72 @@ fn main() {
 
     log("Запуск сервиса");
 
-    let (tx, worker) = spawn_worker();
-    let mut st = Box::new(State {
-        display_sleeping: false,
-        session_locked: false,
-        monitors_disconnected: false,
-        monitor_unresponsive: false,
-        applied_off: false,
-        tx,
-    });
-    unsafe { STATE = &mut *st as *mut State };
+    let (worker_tx, worker) = spawn_worker();
+    let (watch_tx, watch) = spawn_watchdog();
+    *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker_tx.clone());
+    *WATCH_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(watch_tx.clone());
 
     unsafe {
         let hinstance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(ptr::null());
-        let class_name = wide(WINDOW_CLASS);
-
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(wnd_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: ptr::null_mut(),
-            hCursor: ptr::null_mut(),
-            hbrBackground: ptr::null_mut(),
-            lpszMenuName: ptr::null(),
-            lpszClassName: class_name.as_ptr(),
-        };
-        RegisterClassW(&wc);
-
-        // Message-only окно: не рисуется, поэтому нагрузка в простое нулевая.
-        let hwnd = CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            class_name.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            ptr::null_mut(),
-            hinstance,
-            ptr::null(),
-        );
+        let mut hwnd = create_message_window(hinstance);
         if hwnd.is_null() {
             log("Не удалось создать окно сообщений");
-            return;
+        } else {
+            log(&format!("Окно сообщений создано: {hwnd:p}"));
         }
 
-        for guid in [&GUID_CONSOLE_DISPLAY_STATE, &GUID_MONITOR_POWER_ON, &GUID_SESSION_DISPLAY_STATUS] {
-            RegisterPowerSettingNotification(hwnd as _, guid, DEVICE_NOTIFY_WINDOW_HANDLE);
-        }
-        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
-
-        // Поток DDC узнаёт, куда сообщать результат.
-        DDC_HWND.store(hwnd as isize, Ordering::Relaxed);
-        let (ddc_tx, ddc_thread) = spawn_ddc_watcher();
-
-        // Начальное состояние: проверяем текущую топологию мониторов.
-        st.monitors_disconnected = GetSystemMetrics(SM_CMONITORS) == 0;
         log("Начальная топология");
         log_display_topology();
-        st.reconcile();
-        // Инициализация закончена: выгружаем из рабочего набора всё лишнее.
+        MONITORS_GONE.store(GetSystemMetrics(SM_CMONITORS) == 0, Ordering::Release);
+        reconcile();
         trim_working_set();
 
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        // Цикл сообщений. Ожидание блокирующее, но с таймаутом: раз в секунду проверяем,
+        // что окно живо. Если оно пропало, события питания перестали бы приходить вовсе,
+        // поэтому окно пересоздаётся и подписки восстанавливаются.
+        let mut running = true;
+        while running {
+            let wait = MsgWaitForMultipleObjectsEx(0, ptr::null(), HEALTH_CHECK_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if wait == WAIT_OBJECT_0 {
+                loop {
+                    let mut msg: MSG = std::mem::zeroed();
+                    if PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
+                        break;
+                    }
+                    if msg.message == WM_QUIT {
+                        running = false;
+                        break;
+                    }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if !running {
+                break;
+            }
+            if hwnd.is_null() || IsWindow(hwnd) == 0 {
+                log("Окно сообщений пропало — создаю заново");
+                hwnd = create_message_window(hinstance);
+                if hwnd.is_null() {
+                    log("Пересоздать окно не удалось");
+                } else {
+                    log(&format!("Окно сообщений создано: {hwnd:p}"));
+                    // Состояние могло измениться, пока события не приходили.
+                    nudge_watch();
+                }
+            }
         }
 
-        WTSUnRegisterSessionNotification(hwnd);
-        DDC_HWND.store(0, Ordering::Relaxed);
-        drop(ddc_tx);
-        let _ = ddc_thread.join();
+        if !hwnd.is_null() {
+            WTSUnRegisterSessionNotification(hwnd);
+        }
         CloseHandle(mutex);
     }
 
-    // Закрываем канал: рабочий поток вернёт подсветку и завершится.
-    unsafe { STATE = ptr::null_mut() };
-    drop(st);
+    // Закрываем каналы: потоки завершатся, поток HID вернёт подсветку.
+    *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *WATCH_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let _ = watch.join();
     let _ = worker.join();
     log("Остановка сервиса");
 }

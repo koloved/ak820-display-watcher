@@ -149,18 +149,25 @@ When you switch a monitor off with its own button, Windows reports **nothing**: 
 attached. There is no event path for it.
 
 The only remaining signal is that the monitor stops answering DDC/CI. A dedicated thread asks
-each physical monitor for VCP code `0xD6` (power mode) every 10 seconds:
+each physical monitor for VCP code `0xD6` (power mode) every **3 seconds**:
 
 - monitor on → answers `1` in ~55 ms;
 - monitor switched off → the request fails.
 
+**All monitors must be silent** for the backlight to go off: if any one of them still answers, the
+desktop is considered in use. This is what you want when working on one screen out of two.
+
+This polling is also the safety net for the cases where Windows sends no event at all — on the
+machine this was developed on, a display going to sleep by timeout sometimes produced no
+notification whatsoever, and only the poll noticed it.
+
 **False positives.** DDC/CI is noisy: on a healthy monitor, isolated failures appeared 6 times in
 45 seconds. One failure therefore means nothing. The monitor is declared off only after 4
-consecutive failures, 250 ms apart. Retries are cheap because they happen only on suspicion.
+consecutive failures, 200 ms apart. Retries are cheap because they happen only on suspicion.
 
-**Cost.** Measured: 15.6 ms of CPU over 115 seconds, including 90 seconds with the monitor off —
-and all of it went into the single moment the switch-off was detected. In steady state the growth
-is zero, because a failed DDC request returns instantly without burning CPU.
+**Cost.** Measured: ~47 ms of CPU per minute with polling every 3 seconds (0.08% of one core, shown
+as 0% in Task Manager). A DDC request blocks on the I²C bus rather than burning CPU, and a failed
+request returns instantly.
 
 **Skipping work.** While the OS already reports the display as off, polling pauses: it would add
 nothing. Monitor handles are re-created when the topology changes, so the service cannot get stuck
@@ -170,11 +177,16 @@ on a stale handle.
 
 | Thread | Job |
 |---|---|
-| main | window procedure, message loop |
+| main | window procedure and message loop; also supervises the window itself |
 | `hid` | keyboard I/O, blocks on a channel |
-| `ddc` | DDC/CI polling, blocks on `recv_timeout` |
+| `watch` | DDC/CI polling and monitor topology, blocks on `recv_timeout` |
 
-All three sleep in system calls when nothing happens. Stack size is set to 128 KB instead of the
+The state lives in atomics, so any thread can reach the decision. The `watch` thread does not
+depend on the message window: if the window were ever lost, the service would keep reacting to the
+screens going dark, and the message loop re-creates the window and its subscriptions on its own
+(the loop waits with a 1-second timeout and calls `IsWindow`).
+
+All threads sleep in system calls when nothing happens. Stack size is set to 128 KB instead of the
 2 MB default.
 
 `HidApi::new()` (HID enumeration) takes about **10 seconds** on a busy system, while opening the
