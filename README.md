@@ -83,8 +83,21 @@ adds `-Z7`; use `--release`.
 Start `ak820-display-watcher.exe`. Nothing appears — it is a GUI-subsystem binary with no UI.
 A log file is created next to it.
 
-To start it with Windows, put a shortcut to the exe into the startup folder:
-`Win+R` → `shell:startup`.
+### Autostart
+
+Run `autostart.bat` and pick:
+
+```
+[1] Enable autostart   (start with Windows)
+[2] Disable autostart  (remove from startup)
+```
+
+It creates or removes a shortcut in your per-user Startup folder, so no administrator rights are
+needed. The script also accepts `autostart.bat enable`, `autostart.bat disable` and
+`autostart.bat status` for unattended use.
+
+The shortcut appears in Task Manager under the *Startup* tab, where you can disable it later
+without running the script.
 
 ## How it works
 
