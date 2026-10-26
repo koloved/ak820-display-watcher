@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+
+# Logs written next to the executable at runtime
+*.log
+
+# Local ACL recovery data: machine-specific, contains security identifiers
+.acl-recovery/
+
+# Windows shell leftovers
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*~
+*.user
+
+# OS noise
+.DS_Store
