@@ -36,12 +36,17 @@ not report it at all (see [DDC/CI polling](#ddcci-polling)). This application de
 | What happens | Backlight |
 |---|---|
 | Monitor timeout, DPMS off, system sleep | **off** |
+| Display reported as *Dimmed* (low-power state, no image) | **off** |
 | Wake by mouse/keyboard, display back on | **restored** |
 | Monitor switched off with its physical button | **off** within ~11 s |
 | Monitor switched back on | **restored** |
 | All monitors physically disconnected | **off** |
 | `Win + L` (session locked, screen still on) | **stays on** |
 | Unlock | unchanged |
+
+A monitor entering power saving often reports `GUID_CONSOLE_DISPLAY_STATE = 2` (*Dimmed*) instead
+of `0` (*Off*), even though the panel shows nothing. That state is treated as "no image" as well;
+the constant `DIMMED_MEANS_OFF` in `src/main.rs` switches this behaviour.
 
 "Restored" means the exact previous state: the keyboard's 29-byte configuration block is read
 before switching off and written back afterwards, so effect, brightness, speed, direction and

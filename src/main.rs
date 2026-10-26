@@ -58,6 +58,15 @@ const DDC_ATTEMPTS: usize = 4;
 /// Пауза между повторами внутри одной проверки.
 const DDC_RETRY_GAP: Duration = Duration::from_millis(250);
 
+/// Считать ли состояние «Dimmed» (`GUID_CONSOLE_DISPLAY_STATE` = 2) выключенным экраном.
+///
+/// На практике монитор, уходя в энергосбережение по DPMS, нередко рапортует `2`, а не `0`:
+/// изображения на нём уже нет, а Windows продолжает считать дисплей «затемнённым».
+/// Обратный случай — плавное снижение яркости планом питания при простое, когда картинка
+/// ещё видна. Для задачи «гасить подсветку, когда экран тёмный» верно первое, поэтому `2`
+/// трактуется как выключенный экран. Если понадобится обратное поведение, поставьте `false`.
+const DIMMED_MEANS_OFF: bool = true;
+
 static DDC_PAUSED: AtomicBool = AtomicBool::new(false);
 static DDC_RESET: AtomicBool = AtomicBool::new(false);
 static DDC_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -530,7 +539,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         let is_display = guid_eq(&s.PowerSetting, &GUID_CONSOLE_DISPLAY_STATE)
                             || guid_eq(&s.PowerSetting, &GUID_MONITOR_POWER_ON);
                         if is_display {
-                            if value == 0 {
+                            // 0 = выключен, 1 = включён, 2 = затемнён.
+                            let off = match value {
+                                0 => true,
+                                2 => DIMMED_MEANS_OFF,
+                                _ => false,
+                            };
+                            if off {
                                 st.display_sleeping = true;
                             } else {
                                 st.display_on();
