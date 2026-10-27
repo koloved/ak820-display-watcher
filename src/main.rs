@@ -12,6 +12,7 @@
 //! решение не зависит от того, живо ли окно сообщений.
 
 mod ddc;
+mod power;
 #[path = "protocol.rs"]
 mod protocol;
 
@@ -50,24 +51,12 @@ const WINDOW_CLASS: &str = "AK820_DisplayPowerWatcher_Window";
 const LOG_FILE_NAME: &str = "ak820-display-watcher.log";
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
-/// Период опроса мониторов. События питания приходят не всегда: на этой системе
-/// уход экранов в сон по таймауту не сопровождался ни одним уведомлением, поэтому
-/// реакция целиком зависит от опроса. Замерено, что вызов DDC блокируется на ожидании
-/// шины и не занимает процессор, так что частый опрос стоит примерно ничего.
-const WATCH_INTERVAL: Duration = Duration::from_secs(3);
-/// Сколько раз подряд переспрашивать, прежде чем признать мониторы погасшими.
-/// DDC/CI иногда сбоит на ровном месте, одиночному отказу доверять нельзя.
-const DDC_ATTEMPTS: usize = 4;
-/// Пауза между повторами внутри одной проверки.
-const DDC_RETRY_GAP: Duration = Duration::from_millis(200);
-/// Сколько опросов подряд должны молчать все мониторы, чтобы поверить в это.
+/// Период, с которым поток наблюдения просыпается и всё перепроверяет.
 ///
-/// DDC/CI сбоит и на исправном мониторе: в замере одиночные отказы появлялись несколько раз
-/// за минуту, а при опросе каждые 3 секунды один такой провал гасил подсветку и через
-/// мгновение возвращал её. Решение принимается только после устойчивой картины.
-const OFF_CONFIRM_POLLS: u32 = 3;
-/// Сколько опросов подряд должны отвечать мониторы, чтобы вернуть подсветку.
-const ON_CONFIRM_POLLS: u32 = 2;
+/// Здесь проверяются и бездействие, и топология, и ответы мониторов. Раз в десять секунд
+/// достаточно: подсветка гасится и возвращается в пределах этого времени, а лишние
+/// пробуждения процессору ни к чему.
+const WATCH_INTERVAL: Duration = Duration::from_secs(10);
 /// Период проверки живости окна сообщений. Ожидание блокирующее, процессор не занимает.
 const HEALTH_CHECK_MS: u32 = 1000;
 /// Размер стека вспомогательных потоков: по умолчанию Rust резервирует 2 МБ на поток.
@@ -433,14 +422,28 @@ fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
         .spawn(move || {
             let mut monitors: Option<ddc::Monitors> = None;
             let mut acquire_failed = false;
-            // Счётчики подряд идущих опросов для защиты от дребезга DDC/CI.
-            let mut silent_streak: u32 = 0;
-            let mut alive_streak: u32 = 0;
-            while matches!(rx.recv_timeout(WATCH_INTERVAL), Ok(()) | Err(RecvTimeoutError::Timeout)) {
+
+            // Просыпаемся по таймауту или по просьбе проверить немедленно
+            // (сменилась топология, пришло событие «затемнён»).
+            while matches!(
+                rx.recv_timeout(WATCH_INTERVAL),
+                Ok(()) | Err(RecvTimeoutError::Timeout)
+            ) {
                 // Топология изменилась — handles могли устареть.
                 if RESET_MONITORS.swap(false, Ordering::AcqRel) {
                     monitors = None;
                 }
+
+                let gone = unsafe { GetSystemMetrics(SM_CMONITORS) == 0 };
+                MONITORS_GONE.store(gone, Ordering::Release);
+
+                // Если ОС уже знает, что дисплей погашен, опрос ничего не добавит.
+                let paused = DISPLAY_SLEEPING.load(Ordering::Acquire) || gone;
+                if paused {
+                    MONITOR_SILENT.store(false, Ordering::Release);
+                    continue;
+                }
+
                 if monitors.is_none() {
                     monitors = ddc::Monitors::acquire();
                     // Молча ничего не проверять нельзя: без этого «не удалось перечислить»
@@ -454,60 +457,37 @@ fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
                     }
                 }
 
-                let gone = unsafe { GetSystemMetrics(SM_CMONITORS) == 0 };
-                MONITORS_GONE.store(gone, Ordering::Release);
-
-                // Если ОС уже знает, что дисплей погашен, опрос ничего не добавит.
-                let paused = DISPLAY_SLEEPING.load(Ordering::Acquire) || gone;
-                if paused {
-                    MONITOR_SILENT.store(false, Ordering::Release);
-                    silent_streak = 0;
-                    alive_streak = 0;
-                } else {
-                    // Результат этого опроса: true — хотя бы один монитор ещё отвечает.
-                    let responsive = match monitors.as_ref() {
-                        Some(current) => {
-                            let mut r = current.responsive();
-                            if !r {
-                                for _ in 1..DDC_ATTEMPTS {
-                                    sleep(DDC_RETRY_GAP);
-                                    if current.responsive() {
-                                        r = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !r {
-                                // Handles могли умереть вместе с линией — перечислим заново.
-                                monitors = None;
-                            }
-                            r
-                        }
-                        // Перечислить мониторы не удалось: при погашенных экранах это норма,
-                        // поэтому считаем опрос «молчащим», но решение примет счётчик.
-                        None => false,
-                    };
-
-                    if responsive {
-                        alive_streak += 1;
-                        silent_streak = 0;
-                    } else {
-                        silent_streak += 1;
-                        alive_streak = 0;
-                    }
-
-                    // Подсветку гасим только по устойчивой картине, а возвращаем быстрее:
-                    // пусть лучше лишний раз погаснет, чем останется включённой при погасшем
-                    // экране — но и мигать из-за сбоя DDC она не должна.
-                    let silent = if silent_streak >= OFF_CONFIRM_POLLS {
-                        true
-                    } else if alive_streak >= ON_CONFIRM_POLLS {
-                        false
-                    } else {
-                        MONITOR_SILENT.load(Ordering::Acquire)
-                    };
-                    MONITOR_SILENT.store(silent, Ordering::Release);
+                // Первый признак: молчание мониторов. Так ловится выключение кнопкой,
+                // о котором Windows не сообщает вовсе.
+                let ddc_silent = monitors.as_ref().is_some_and(|m| !m.responsive());
+                if ddc_silent {
+                    // Handles могли умереть вместе с линией — перечислим заново.
+                    monitors = None;
                 }
+
+                // Второй признак: бездействие достигло таймаута плана питания, значит
+                // Windows уже погасила экраны. Нужен, когда монитор продолжает отвечать,
+                // уже погаснув: тогда одного молчания недостаточно.
+                let locked = SESSION_LOCKED.load(Ordering::Acquire);
+                let timeout = power::display_timeout_seconds(locked);
+                let idle = power::idle_seconds();
+                let by_idle = match timeout {
+                    Some(seconds) if seconds > 0 => {
+                        idle >= seconds as u64 && !power::screen_held_awake()
+                    }
+                    // 0 — «никогда»: вывод по бездействию неприменим.
+                    _ => false,
+                };
+
+                let silent = ddc_silent || by_idle;
+                if silent != MONITOR_SILENT.load(Ordering::Acquire) {
+                    log(&format!(
+                        "Опрос: бездействие {idle} с, таймаут {}, DDC: {}, по бездействию: {by_idle} → экраны погашены: {silent}",
+                        timeout.map_or("нет".to_string(), |t| format!("{t} с")),
+                        if ddc_silent { "молчат" } else { "отвечают" },
+                    ));
+                }
+                MONITOR_SILENT.store(silent, Ordering::Release);
 
                 reconcile();
             }

@@ -142,43 +142,50 @@ one write, not five.
 `session_locked` is tracked but intentionally excluded from that condition — that is the whole
 point of the project.
 
-### DDC/CI polling
+### Detecting that the screens are dark
 
-When you switch a monitor off with its own button, Windows reports **nothing**: no
-`WM_DISPLAYCHANGE`, no power event, `SM_CMONITORS` unchanged, the monitor still counted as
-attached. There is no event path for it.
+Windows cannot be relied on here. On this machine, displays going to sleep by timeout sometimes
+produced no notification at all, and switching a monitor off with its own button produces **no**
+event whatsoever: no `WM_DISPLAYCHANGE`, no power event, `SM_CMONITORS` unchanged, the monitor
+still counted as attached.
 
-The only remaining signal is that the monitor stops answering DDC/CI. A dedicated thread asks
-each physical monitor for VCP code `0xD6` (power mode) every **3 seconds**:
+Two independent signals are checked every **10 seconds**, and either one is enough.
+
+**1. Idle time against the power plan.** Windows turns the displays off itself, exactly when the
+idle timer reaches the timeout configured in the active power scheme. Reading that timeout
+(`VIDEOIDLE`, or `VIDEOCONLOCK` while the session is locked) and comparing it with
+`GetLastInputInfo` gives a reliable answer that does not depend on the monitors at all.
+
+This signal is what made the feature work. Monitors are unreliable narrators: in a measurement on
+a two-monitor setup, one of them answered `1` ("on") over DDC/CI for minutes while the panel was
+already dark, so "every monitor is silent" could never become true.
+
+Two guards keep it honest:
+
+- a timeout of `0` ("never") disables the rule;
+- exclusive full-screen Direct3D and presentation mode are ignored, because those keep the display
+  on regardless of idle time. `QUNS_BUSY` is deliberately *not* in that list — Windows reports it
+  for any maximized window, which would block the rule almost permanently.
+
+**2. DDC/CI silence.** A thread asks each physical monitor for VCP code `0xD6` (power mode):
 
 - monitor on → answers `1` in ~55 ms;
-- monitor switched off → the request fails.
+- monitor off, or switched off with its own button → the request fails.
 
-**All monitors must be silent** for the backlight to go off: if any one of them still answers, the
-desktop is considered in use. This is what you want when working on one screen out of two.
+**Every** monitor must stay silent for this signal to fire, so working on one screen out of two
+keeps the backlight on. This is the only thing that catches a monitor switched off by its own
+button, because Windows reports nothing at all in that case.
 
-This polling is also the safety net for the cases where Windows sends no event at all — on the
-machine this was developed on, a display going to sleep by timeout sometimes produced no
-notification whatsoever, and only the poll noticed it.
-
-**False positives.** DDC/CI is noisy: on a healthy monitor, isolated failures appeared 6 times in
-45 seconds. A single failure therefore means nothing, and the backlight must not flicker because
-of one. Two levels of protection:
-
-- each poll retries up to 4 times, 200 ms apart, before it reports silence;
-- a poll result is accepted only after **3 consecutive polls agree** that all monitors are silent
-  (about 9 seconds). Returning to the "on" state needs 2 agreeing polls.
-
-Measured on this machine, an earlier build without the second rule turned the backlight off and
-back on within 3 seconds — exactly the kind of flicker the counter prevents.
-
-**Cost.** Measured: ~47 ms of CPU per minute with polling every 3 seconds (0.08% of one core, shown
-as 0% in Task Manager). A DDC request blocks on the I²C bus rather than burning CPU, and a failed
+**Cost.** Measured over two minutes with a 10-second period: **31 ms of CPU** (0.03% of one core,
+0% in Task Manager). A DDC request blocks on the I²C bus instead of burning CPU, and a failed
 request returns instantly.
 
-**Skipping work.** While the OS already reports the display as off, polling pauses: it would add
+**Skipping work.** While the OS already reports the display as off, the poll pauses: it would add
 nothing. Monitor handles are re-created when the topology changes, so the service cannot get stuck
 on a stale handle.
+
+**Reaction time.** Both directions land within the 10-second period: the backlight goes off right
+as Windows turns the panels off, and comes back within ten seconds of the first mouse movement.
 
 ### Threads
 
