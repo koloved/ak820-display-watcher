@@ -21,3 +21,7 @@ $RECYCLE.BIN/
 
 # OS noise
 .DS_Store
+
+# Local machine backup of the removed Salad autostart entry
+salad-autostart-backup.reg
+

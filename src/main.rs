@@ -11,7 +11,6 @@
 //! Состояние хранится в атомиках, поэтому вердикт можно принять из любого потока:
 //! решение не зависит от того, живо ли окно сообщений.
 
-mod ddc;
 mod power;
 #[path = "protocol.rs"]
 mod protocol;
@@ -92,12 +91,14 @@ static DISPLAY_SLEEPING: AtomicBool = AtomicBool::new(false);
 static SESSION_LOCKED: AtomicBool = AtomicBool::new(false);
 /// `SM_CMONITORS == 0` — мониторов нет вовсе.
 static MONITORS_GONE: AtomicBool = AtomicBool::new(false);
-/// Ни один монитор не ответил по DDC/CI — погашены все.
-static MONITOR_SILENT: AtomicBool = AtomicBool::new(false);
+/// Экраны считаются погашенными.
+///
+/// Состояние намеренно «липкое»: включается любым признаком тьмы, а снимается только явным
+/// свидетельством, что изображение вернулось. Иначе нажатие клавиши сбрасывало бы время
+/// бездействия и возвращало подсветку при по-прежнему погашенных экранах.
+static SCREENS_DARK: AtomicBool = AtomicBool::new(false);
 /// Состояние, уже отправленное в поток HID.
 static APPLIED_OFF: AtomicBool = AtomicBool::new(false);
-/// Топология изменилась: handles мониторов нужно пересоздать.
-static RESET_MONITORS: AtomicBool = AtomicBool::new(false);
 
 static WORKER_TX: Mutex<Option<Sender<bool>>> = Mutex::new(None);
 static WATCH_TX: Mutex<Option<Sender<()>>> = Mutex::new(None);
@@ -111,7 +112,7 @@ static RECONCILE: Mutex<()> = Mutex::new(());
 fn should_be_off() -> bool {
     DISPLAY_SLEEPING.load(Ordering::Acquire)
         || MONITORS_GONE.load(Ordering::Acquire)
-        || MONITOR_SILENT.load(Ordering::Acquire)
+        || SCREENS_DARK.load(Ordering::Acquire)
 }
 
 /// Отправляет команду, только если результирующее состояние изменилось.
@@ -122,11 +123,11 @@ fn reconcile() {
         return;
     }
     log(&format!(
-        "Состояние: сон={} блокировка={} мониторы_отключены={} мониторы_молчат={} → выключить={want_off}",
+        "Состояние: сон={} блокировка={} мониторы_отключены={} экраны_погашены={} → выключить={want_off}",
         DISPLAY_SLEEPING.load(Ordering::Acquire),
         SESSION_LOCKED.load(Ordering::Acquire),
         MONITORS_GONE.load(Ordering::Acquire),
-        MONITOR_SILENT.load(Ordering::Acquire),
+        SCREENS_DARK.load(Ordering::Acquire),
     ));
     if let Ok(guard) = WORKER_TX.lock() {
         if let Some(tx) = guard.as_ref() {
@@ -136,10 +137,10 @@ fn reconcile() {
     APPLIED_OFF.store(want_off, Ordering::Release);
 }
 
-/// Экран снова включился: прежний вывод DDC устарел, подсветка возвращается сразу.
+/// Экран снова включился: событие ОС — самое сильное свидетельство, что изображение есть.
 fn display_on() {
     DISPLAY_SLEEPING.store(false, Ordering::Release);
-    MONITOR_SILENT.store(false, Ordering::Release);
+    SCREENS_DARK.store(false, Ordering::Release);
 }
 
 /// Будит поток наблюдения, чтобы он проверил мониторы немедленно.
@@ -173,6 +174,52 @@ fn log(msg: &str) {
         .unwrap_or(0);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{ts}] {msg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Конфигурация на диске: страховка от внезапного отключения питания
+// ---------------------------------------------------------------------------
+
+/// Файл с конфигурацией, снятой перед выключением подсветки.
+///
+/// Клавиатура запоминает записанную в неё яркость. Если компьютер выключить из розетки
+/// или пропадёт электричество, пока подсветка погашена, после включения клавиатура
+/// останется тёмной. Поэтому исходная конфигурация сохраняется на диск и возвращается
+/// при следующем запуске.
+const SAVED_CONFIG_FILE: &str = "ak820-saved-config.bin";
+
+fn saved_config_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(SAVED_CONFIG_FILE)))
+}
+
+fn save_config_to_disk(cfg: &[u8; CONFIG_LEN]) {
+    match saved_config_path() {
+        Some(path) => {
+            if let Err(e) = fs::write(&path, cfg) {
+                log(&format!("Не удалось сохранить конфигурацию на диск: {e}"));
+            }
+        }
+        None => log("Не удалось определить путь для сохранения конфигурации"),
+    }
+}
+
+fn load_config_from_disk() -> Option<[u8; CONFIG_LEN]> {
+    let data = fs::read(saved_config_path()?).ok()?;
+    if data.len() != CONFIG_LEN {
+        log(&format!("Файл конфигурации повреждён: {} байт", data.len()));
+        return None;
+    }
+    let mut cfg = [0u8; CONFIG_LEN];
+    cfg.copy_from_slice(&data);
+    Some(cfg)
+}
+
+fn clear_saved_config() {
+    if let Some(path) = saved_config_path() {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -318,9 +365,14 @@ impl Keyboard {
                 }
             }
         }
-        let Some(mut cfg) = self.saved else {
+        let Some(original) = self.saved else {
             return false;
         };
+        // Сначала пишем на диск, и только потом гасим клавиатуру: если питание пропадёт
+        // сразу после записи, конфигурация уже будет сохранена и вернётся при запуске.
+        save_config_to_disk(&original);
+
+        let mut cfg = original;
         cfg[protocol::BRIGHTNESS_INDEX] = 0;
         match self.write_config(&cfg) {
             Ok(()) => {
@@ -336,20 +388,46 @@ impl Keyboard {
 
     /// Возвращает подсветку к сохранённой конфигурации.
     ///
-    /// Если конфиг не снимался, подсветку и не гасили — ничего не трогаем.
+    /// Конфигурация берётся из памяти, а если её там нет — с диска: так подсветка
+    /// возвращается после перезапуска или сбоя питания.
     fn restore(&mut self) -> bool {
-        let Some(cfg) = self.saved else {
+        let Some(cfg) = self.saved.or_else(load_config_from_disk) else {
             return false;
         };
         match self.write_config(&cfg) {
             Ok(()) => {
                 self.saved = None;
+                clear_saved_config();
                 log("Подсветка восстановлена");
                 true
             }
             Err(e) => {
                 // Конфиг сохраняем: следующая попытка восстановления ещё возможна.
                 log(&format!("Восстановление не удалось: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Возвращает подсветку, если она осталась погашенной с прошлого запуска.
+    ///
+    /// Так бывает, когда компьютер выключили из розетки или пропало электричество:
+    /// клавиатура запомнила нулевую яркость, а приложение не успело вернуть конфигурацию.
+    fn recover_after_power_loss(&mut self) -> bool {
+        let Some(cfg) = load_config_from_disk() else {
+            return false;
+        };
+        if !self.connect() {
+            return false;
+        }
+        match self.write_config(&cfg) {
+            Ok(()) => {
+                clear_saved_config();
+                log("Подсветка восстановлена после сбоя питания");
+                true
+            }
+            Err(e) => {
+                log(&format!("Восстановление после сбоя питания не удалось: {e}"));
                 false
             }
         }
@@ -377,6 +455,10 @@ fn spawn_worker() -> (Sender<bool>, JoinHandle<()>) {
             } else {
                 log("Клавиатура не найдена, подключусь при первом событии");
             }
+
+            // Если подсветка осталась погашенной с прошлого запуска (пропадало питание),
+            // вернуть её сразу, не дожидаясь событий экрана.
+            kb.recover_after_power_loss();
 
             // Блокирующее ожидание: без опроса, поток спит пока нет команд.
             while let Ok(first) = rx.recv() {
@@ -407,71 +489,45 @@ fn spawn_worker() -> (Sender<bool>, JoinHandle<()>) {
 }
 
 // ---------------------------------------------------------------------------
-// Поток наблюдения: топология и DDC/CI
+// Поток наблюдения: бездействие и топология
 // ---------------------------------------------------------------------------
 
 /// Раз в `WATCH_INTERVAL` (или немедленно по запросу) проверяет, есть ли изображение.
 ///
-/// Здесь же ловится монитор, выключенный кнопкой: Windows об этом не сообщает вообще,
-/// единственный признак — монитор перестаёт отвечать на DDC-запрос.
+/// Решение принимается по бездействию: Windows гасит экраны ровно по истечении таймаута
+/// из плана питания, поэтому превышение таймаута означает «изображения нет».
+///
+/// Опрос мониторов по DDC/CI убран полностью: он сам будил спящие экраны, а на одиночном
+/// мониторе давал ложные срабатывания при сбоях шины. Плата — перестаёт отслеживаться
+/// выключение монитора его собственной кнопкой, но Windows об этом всё равно не сообщает,
+/// а на практике этим способом никто не пользуется.
 fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
     let (tx, rx) = channel::<()>();
     let handle = std::thread::Builder::new()
         .name("watch".into())
         .stack_size(STACK_SIZE)
         .spawn(move || {
-            let mut monitors: Option<ddc::Monitors> = None;
-            let mut acquire_failed = false;
-
             // Просыпаемся по таймауту или по просьбе проверить немедленно
             // (сменилась топология, пришло событие «затемнён»).
             while matches!(
                 rx.recv_timeout(WATCH_INTERVAL),
                 Ok(()) | Err(RecvTimeoutError::Timeout)
             ) {
-                // Топология изменилась — handles могли устареть.
-                if RESET_MONITORS.swap(false, Ordering::AcqRel) {
-                    monitors = None;
-                }
-
                 let gone = unsafe { GetSystemMetrics(SM_CMONITORS) == 0 };
                 MONITORS_GONE.store(gone, Ordering::Release);
 
-                // Если ОС уже знает, что дисплей погашен, опрос ничего не добавит.
-                let paused = DISPLAY_SLEEPING.load(Ordering::Acquire) || gone;
-                if paused {
-                    MONITOR_SILENT.store(false, Ordering::Release);
+                // Если ОС сообщила, что дисплей погашен, её слово сильнее нашего.
+                if DISPLAY_SLEEPING.load(Ordering::Acquire) || gone {
+                    SCREENS_DARK.store(false, Ordering::Release);
+                    reconcile();
                     continue;
                 }
 
-                if monitors.is_none() {
-                    monitors = ddc::Monitors::acquire();
-                    // Молча ничего не проверять нельзя: без этого «не удалось перечислить»
-                    // выглядело бы как «всё хорошо».
-                    if monitors.is_none() && !acquire_failed {
-                        log("DDC: не удалось перечислить мониторы");
-                        acquire_failed = true;
-                    } else if monitors.is_some() && acquire_failed {
-                        log("DDC: мониторы снова перечисляются");
-                        acquire_failed = false;
-                    }
-                }
-
-                // Первый признак: молчание мониторов. Так ловится выключение кнопкой,
-                // о котором Windows не сообщает вовсе.
-                let ddc_silent = monitors.as_ref().is_some_and(|m| !m.responsive());
-                if ddc_silent {
-                    // Handles могли умереть вместе с линией — перечислим заново.
-                    monitors = None;
-                }
-
-                // Второй признак: бездействие достигло таймаута плана питания, значит
-                // Windows уже погасила экраны. Нужен, когда монитор продолжает отвечать,
-                // уже погаснув: тогда одного молчания недостаточно.
-                let locked = SESSION_LOCKED.load(Ordering::Acquire);
-                let timeout = power::display_timeout_seconds(locked);
+                // Windows гасит экраны ровно по истечении таймаута бездействия из плана
+                // питания, поэтому превышение таймаута означает: изображения нет.
+                let timeout = power::display_timeout_seconds();
                 let idle = power::idle_seconds();
-                let by_idle = match timeout {
+                let dark = match timeout {
                     Some(seconds) if seconds > 0 => {
                         idle >= seconds as u64 && !power::screen_held_awake()
                     }
@@ -479,15 +535,13 @@ fn spawn_watchdog() -> (Sender<()>, JoinHandle<()>) {
                     _ => false,
                 };
 
-                let silent = ddc_silent || by_idle;
-                if silent != MONITOR_SILENT.load(Ordering::Acquire) {
+                if dark != SCREENS_DARK.load(Ordering::Acquire) {
                     log(&format!(
-                        "Опрос: бездействие {idle} с, таймаут {}, DDC: {}, по бездействию: {by_idle} → экраны погашены: {silent}",
+                        "Опрос: бездействие {idle} с, таймаут {} → экраны погашены: {dark}",
                         timeout.map_or("нет".to_string(), |t| format!("{t} с")),
-                        if ddc_silent { "молчат" } else { "отвечают" },
                     ));
                 }
-                MONITOR_SILENT.store(silent, Ordering::Release);
+                SCREENS_DARK.store(dark, Ordering::Release);
 
                 reconcile();
             }
@@ -625,7 +679,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_DISPLAYCHANGE => {
             log("Смена конфигурации дисплеев");
-            RESET_MONITORS.store(true, Ordering::Release);
             MONITORS_GONE.store(GetSystemMetrics(SM_CMONITORS) == 0, Ordering::Release);
             log_display_topology();
             nudge_watch();

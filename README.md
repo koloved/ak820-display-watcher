@@ -28,8 +28,8 @@ Lock the workstation with `Win + L`: the backlight stays on, you can log in. Lea
 the monitor time out: everything goes dark. Move the mouse in the morning: the screen comes back
 and the keyboard lights up with it, exactly in the mode, color and speed you had.
 
-Turning the monitor off with its **physical power button** is a separate problem — Windows does
-not report it at all (see [DDC/CI polling](#ddcci-polling)). This application detects it anyway.
+Turning the monitor off with its **physical power button** is not detected — Windows reports
+nothing in that case. That limitation is deliberate: see [How darkness is detected](#how-darkness-is-detected).
 
 ## Behavior
 
@@ -38,19 +38,22 @@ not report it at all (see [DDC/CI polling](#ddcci-polling)). This application de
 | Monitor timeout, DPMS off, system sleep | **off** |
 | Display reported as *Dimmed* (low-power state, no image) | **off** |
 | Wake by mouse/keyboard, display back on | **restored** |
-| Monitor switched off with its physical button | **off** within ~11 s |
-| Monitor switched back on | **restored** |
 | All monitors physically disconnected | **off** |
 | `Win + L` (session locked, screen still on) | **stays on** |
 | Unlock | unchanged |
+| Power lost while the backlight was off | **restored on next start** |
 
 A monitor entering power saving often reports `GUID_CONSOLE_DISPLAY_STATE = 2` (*Dimmed*) instead
-of `0` (*Off*), even though the panel shows nothing. That state is treated as "no image" as well;
-the constant `DIMMED_MEANS_OFF` in `src/main.rs` switches this behaviour.
+of `0` (*Off*), even though the panel shows nothing. That state is treated as "no image" as well.
 
 "Restored" means the exact previous state: the keyboard's 29-byte configuration block is read
 before switching off and written back afterwards, so effect, brightness, speed, direction and
 color all return as they were.
+
+**Power loss.** The keyboard remembers the brightness written into it. If the machine is unplugged
+while the backlight is off, the keyboard would stay dark forever — so the original configuration
+block is also written to a file next to the executable. On the next start the file is written back
+into the keyboard and deleted.
 
 ## Features
 
@@ -133,7 +136,7 @@ Only three independent flags can switch the backlight off:
 ```rust
 display_sleeping        // the OS says the display is off
 monitors_disconnected   // GetSystemMetrics(SM_CMONITORS) == 0
-monitor_unresponsive    // the monitor stopped answering DDC/CI
+screens_dark            // idle time exceeded the display timeout
 ```
 
 A command is sent **only when the combined result changes**, so a burst of related events causes
@@ -142,23 +145,14 @@ one write, not five.
 `session_locked` is tracked but intentionally excluded from that condition — that is the whole
 point of the project.
 
-### Detecting that the screens are dark
+### How darkness is detected
 
-Windows cannot be relied on here. On this machine, displays going to sleep by timeout sometimes
-produced no notification at all, and switching a monitor off with its own button produces **no**
-event whatsoever: no `WM_DISPLAYCHANGE`, no power event, `SM_CMONITORS` unchanged, the monitor
-still counted as attached.
+Windows cannot be relied on here: on this machine, displays going to sleep by timeout sometimes
+produced no notification at all.
 
-Two independent signals are checked every **10 seconds**, and either one is enough.
-
-**1. Idle time against the power plan.** Windows turns the displays off itself, exactly when the
-idle timer reaches the timeout configured in the active power scheme. Reading that timeout
-(`VIDEOIDLE`, or `VIDEOCONLOCK` while the session is locked) and comparing it with
-`GetLastInputInfo` gives a reliable answer that does not depend on the monitors at all.
-
-This signal is what made the feature work. Monitors are unreliable narrators: in a measurement on
-a two-monitor setup, one of them answered `1` ("on") over DDC/CI for minutes while the panel was
-already dark, so "every monitor is silent" could never become true.
+A thread wakes every **10 seconds** and compares the idle time from `GetLastInputInfo` with the
+display timeout of the active power scheme (`VIDEOIDLE`). Windows turns the panels off itself
+exactly when that timeout is reached, so exceeding it means there is no image.
 
 Two guards keep it honest:
 
@@ -167,25 +161,27 @@ Two guards keep it honest:
   on regardless of idle time. `QUNS_BUSY` is deliberately *not* in that list — Windows reports it
   for any maximized window, which would block the rule almost permanently.
 
-**2. DDC/CI silence.** A thread asks each physical monitor for VCP code `0xD6` (power mode):
+**Reaction time.** Both directions land within the 10-second period: the backlight goes off as
+Windows turns the panels off, and comes back within ten seconds of the first mouse movement.
 
-- monitor on → answers `1` in ~55 ms;
-- monitor off, or switched off with its own button → the request fails.
+**Cost.** Measured: **31 ms of CPU per two minutes** (0.03% of one core, 0% in Task Manager).
+Between checks the thread is blocked in `recv_timeout`.
 
-**Every** monitor must stay silent for this signal to fire, so working on one screen out of two
-keeps the backlight on. This is the only thing that catches a monitor switched off by its own
-button, because Windows reports nothing at all in that case.
+### What was removed, and why
 
-**Cost.** Measured over two minutes with a 10-second period: **31 ms of CPU** (0.03% of one core,
-0% in Task Manager). A DDC request blocks on the I²C bus instead of burning CPU, and a failed
-request returns instantly.
+Earlier versions also polled the monitors over **DDC/CI** (VCP `0xD6`, power mode) to catch a
+monitor switched off by its own button. That was dropped:
 
-**Skipping work.** While the OS already reports the display as off, the poll pauses: it would add
-nothing. Monitor handles are re-created when the topology changes, so the service cannot get stuck
-on a stale handle.
+- the polling itself woke sleeping panels — a DDC request pulls a monitor out of standby, Windows
+  reports "display on", and the screens came back within ~14 seconds. The service was fighting
+  the very sleep it was supposed to respect;
+- on a single-monitor setup a routine DDC glitch (two failed replies in a row) turned the keyboard
+  off for ten seconds while the user was typing. Five such false positives were logged in one
+  evening.
 
-**Reaction time.** Both directions land within the 10-second period: the backlight goes off right
-as Windows turns the panels off, and comes back within ten seconds of the first mouse movement.
+The cost of removing it: switching a monitor off with its own button is no longer detected. Windows
+reports nothing in that case, and in five days of logs not a single such event was recorded, so
+nothing of value was lost.
 
 ### Threads
 
@@ -193,7 +189,7 @@ as Windows turns the panels off, and comes back within ten seconds of the first 
 |---|---|
 | main | window procedure and message loop; also supervises the window itself |
 | `hid` | keyboard I/O, blocks on a channel |
-| `watch` | DDC/CI polling and monitor topology, blocks on `recv_timeout` |
+| `watch` | idle time and monitor topology, blocks on `recv_timeout` |
 
 The state lives in atomics, so any thread can reach the decision. The `watch` thread does not
 depend on the message window: if the window were ever lost, the service would keep reacting to the
@@ -244,11 +240,11 @@ switches the backlight off for two seconds and restores the original block. Usef
 protocol on a new revision of the hardware.
 
 ```cmd
-cargo run --release --example ddc -- 45
+cargo run --release --example readcfg
 ```
 
-Polls the monitor over DDC/CI for 45 seconds and prints the power state. Press the monitor button
-while it runs: if the state stops answering, this monitor supports detection.
+Prints the current 29-byte configuration block and the decoded brightness, without changing
+anything. Handy to confirm what state the keyboard is actually in.
 
 The technical specification (in Russian) is in [TA.txt](TA.txt).
 

@@ -35,13 +35,6 @@ const VIDEO_POWERDOWN_TIMEOUT: GUID = GUID {
     data3: 0x4e07,
     data4: [0xa9, 0x73, 0x6b, 0x14, 0xcb, 0xcb, 0x2b, 0x7e],
 };
-/// «Отключать экран при блокировке через», секунды.
-const CONSOLE_LOCK_DISPLAY_OFF: GUID = GUID {
-    data1: 0x8ec4b3a5,
-    data2: 0x6868,
-    data3: 0x48c2,
-    data4: [0xbe, 0x75, 0x4f, 0x30, 0x44, 0xbe, 0x88, 0xa7],
-};
 
 /// На линии питания (иначе — от батареи).
 fn on_ac() -> bool {
@@ -55,23 +48,34 @@ fn on_ac() -> bool {
 
 /// Через сколько секунд бездействия Windows гасит экраны.
 ///
+/// Берётся только `VIDEOIDLE`. `VIDEOCONLOCK` («отключать экран при блокировке») намеренно
+/// не используется: на проверенной системе Windows его не соблюдала, и правило по
+/// бездействию гасило подсветку при работающих экранах.
+///
 /// `0` означает «никогда» — тогда вывод по бездействию не применяется.
-pub fn display_timeout_seconds(locked: bool) -> Option<u32> {
+pub fn display_timeout_seconds() -> Option<u32> {
     unsafe {
         let mut scheme: *mut GUID = ptr::null_mut();
         if PowerGetActiveScheme(ptr::null_mut(), &mut scheme) != 0 || scheme.is_null() {
             return None;
         }
-        let setting = if locked {
-            &CONSOLE_LOCK_DISPLAY_OFF
-        } else {
-            &VIDEO_POWERDOWN_TIMEOUT
-        };
         let mut index = 0u32;
         let rc = if on_ac() {
-            PowerReadACValueIndex(ptr::null_mut(), scheme, &VIDEO_SUBGROUP, setting, &mut index)
+            PowerReadACValueIndex(
+                ptr::null_mut(),
+                scheme,
+                &VIDEO_SUBGROUP,
+                &VIDEO_POWERDOWN_TIMEOUT,
+                &mut index,
+            )
         } else {
-            PowerReadDCValueIndex(ptr::null_mut(), scheme, &VIDEO_SUBGROUP, setting, &mut index)
+            PowerReadDCValueIndex(
+                ptr::null_mut(),
+                scheme,
+                &VIDEO_SUBGROUP,
+                &VIDEO_POWERDOWN_TIMEOUT,
+                &mut index,
+            )
         };
         LocalFree(scheme as _);
         if rc != 0 {
